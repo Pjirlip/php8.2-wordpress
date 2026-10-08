@@ -4,21 +4,19 @@ SHELL ["/bin/bash", "-c"]
 
 RUN addgroup --gid 1000 propeller && useradd --system -u 1000 -g propeller propeller 
 
-ENV PROVISION_CONTEXT "production"
-ENV DEBIAN_FRONTEND noninteractive
-ENV TZ Europe/Berlin
-
-ENV APACHE_LOCK_DIR /var/lock/apache2
-ENV APACHE_LOG_DIR /var/log/apache2
-ENV APACHE_PID_FILE /var/run/apache2/apache2.pid
-ENV APACHE_SERVER_NAME localhost
+ENV PROVISION_CONTEXT="production"
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Europe/Berlin
+ENV APACHE_LOCK_DIR=/var/lock/apache2
+ENV APACHE_LOG_DIR=/var/log/apache2
+ENV APACHE_PID_FILE=/var/run/apache2/apache2.pid
+ENV APACHE_SERVER_NAME=localhost
 ENV APACHE_RUN_USER=propeller
 ENV APACHE_RUN_GROUP=propeller
 ENV APACHE_RUN_DIR=/var/run/apache2
 ENV DOCUMENT_ROOT=/var/www/html
 ENV LETSENCRYPT_EMAIL=certbot@propeller.de
-ENV PORT 80
-
+ENV PORT=80
 # Apache runtime tuning (K1, K2, H4). An empty APACHE_MAX_REQUEST_WORKERS lets entrypoint.sh derive the
 # value from the container memory limit: floor((limit_MiB - BASELINE_MB) / CHILD_MB)
 ENV APACHE_MAX_REQUEST_WORKERS="" \
@@ -30,14 +28,12 @@ ENV APACHE_MAX_REQUEST_WORKERS="" \
     APACHE_TIMEOUT=120 \
     APACHE_ALLOW_OVERRIDE=All
 
-ENV SMTP_SERVER example.com
+ENV SMTP_SERVER=example.com
 ENV SMTP_PORT=25
-ENV SMTP_FROM mail@example.com
-
-ENV PHP_MEMORY_LIMIT 256M
-ENV PHP_MAX_EXEC_TIME 240
-ENV PHP_POST_AND_UPLOAD_MAX_SIZE 50M
-
+ENV SMTP_FROM=mail@example.com
+ENV PHP_MEMORY_LIMIT=256M
+ENV PHP_MAX_EXEC_TIME=240
+ENV PHP_POST_AND_UPLOAD_MAX_SIZE=50M
 # PHP runtime tuning (K2, H4)
 ENV PHP_OPCACHE_MEMORY=192 \
     PHP_OPCACHE_MAX_FILES=50000 \
@@ -112,6 +108,11 @@ RUN apt-get update && \
     && a2enmod rewrite deflate headers mime expires filter setenvif env authz_core auth_basic alias \
     && echo "export PATH=":$PATH"" \
     && apt-get clean \
+    # keep the runtime libraries the compiled extensions link against (libzip, libxslt, ...);
+    # --auto-remove would otherwise drop them together with the -dev packages
+    && ldd "$(php -r 'echo ini_get("extension_dir");')"/*.so \
+        | awk '/=>/ { so = $(NF-1); if (index(so, "/usr/local/") == 1) { next }; gsub("^/(usr/)?", "", so); printf "*%s\n", so }' \
+        | sort -u | xargs -r dpkg-query --search | cut -d: -f1 | sort -u | xargs -r apt-mark manual \
     && apt-get purge -y --auto-remove \
         libxml2-dev \
         libfreetype6-dev \
@@ -132,7 +133,15 @@ RUN apt-get update && \
         pkg-config \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* 
 
-RUN sed -i '/disable ghostscript format types/,+6d' /etc/ImageMagick-6/policy.xml
+# Allow ImageMagick (and the imagick extension) to read PDF/PostScript via Ghostscript for PDF thumbnails.
+# Debian ships the policy under /etc/ImageMagick-6 (bookworm) or /etc/ImageMagick-7 (trixie); the coder
+# entries are switched from rights="none" to rights="read|write" instead of deleting lines by position.
+RUN set -eu; \
+    for policy in /etc/ImageMagick-*/policy.xml; do \
+        sed -i -E '/domain="coder"/ { /pattern="[^"]*(PDF|PS|EPS|XPS)[^"]*"/ s/rights="none"/rights="read|write"/; }' "$policy"; \
+        if grep 'domain="coder"' "$policy" | grep 'rights="none"' | grep -qE 'pattern="[^"]*(PDF|PS|EPS|XPS)'; then echo "PDF/PS coders still restricted in $policy"; exit 1; fi; \
+        echo "ImageMagick policy adjusted: $policy"; \
+    done
 ADD https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar /bin/wp-cli
 RUN chmod +x /bin/wp-cli
 
@@ -141,10 +150,9 @@ RUN (ssh-keyscan -T 5 -H gitlab.propeller.de atum.propeller.de >> /etc/ssh/ssh_k
 
 # Generate and set Locale
 RUN locale-gen
-ENV LC_ALL en_US.UTF-8 
-ENV LANG en_US.UTF-8  
-ENV LANGUAGE en_US:en  
-
+ENV LC_ALL=en_US.UTF-8
+ENV LANG=en_US.UTF-8
+ENV LANGUAGE=en_US:en
 # Set Timezone
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
@@ -161,6 +169,9 @@ RUN mv "$PHP_INI_DIR/php.ini-production" "$PHP_INI_DIR/php.ini"
 
 # Validate the complete configuration at build time without starting a daemon (H6)
 RUN APACHE_MAX_REQUEST_WORKERS=8 apache2ctl -t
+
+# Every compiled extension has to load; a missing runtime library would otherwise only show up as a PHP startup warning
+RUN for ext in gd imagick intl ldap redis soap xsl zip; do php -m | grep -qix "$ext" || { echo "extension $ext failed to load"; exit 1; }; done
 
 EXPOSE $PORT
 
